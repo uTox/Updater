@@ -58,6 +58,7 @@ static void* checksignature(void *data, uint32_t dlen, const uint8_t *self_publi
         return NULL;
     }
 
+    LOG_TO_FILE("Signature cleared\n");
     return mdata;
 }
 
@@ -66,8 +67,7 @@ static void* download( struct sockaddr_storage *sock_addr,
                        size_t addr_len,
                        char *request,
                        uint16_t request_len,
-                       uint32_t *downloaded_length,
-                       uint32_t downloaded_len_max)
+                       uint32_t *downloaded_length)
 {
     uint32_t sock, len, rlen, dlen;
     char *data = 0;
@@ -97,7 +97,6 @@ static void* download( struct sockaddr_storage *sock_addr,
         if (!header) {
             /* work with a null-terminated buffer */
             recvbuf[len] = 0;
-
             /* check for "Not Found" response (todo: only check first line of response)*/
             if (strstr((char*)recvbuf, "404 Not Found\r\n")) {
                 LOG_TO_FILE("Not Found\n");
@@ -114,10 +113,6 @@ static void* download( struct sockaddr_storage *sock_addr,
             /* parse the length field */
             str += sizeof("Content-Length: ") - 1;
             dlen = strtol(str, NULL, 10);
-            if (dlen > downloaded_len_max) {
-                LOG_TO_FILE("too large\n");
-                break;
-            }
 
             /* find the end of the http response header */
             str = strstr(str, "\r\n\r\n");
@@ -203,7 +198,6 @@ void* download_signed( void *sock_addr,
                        const char *filename,
                        size_t filename_len,
                        uint32_t *downloaded_len,
-                       uint32_t downloaded_len_max,
                        const uint8_t *self_public_key)
 {
     void *data, *mdata;
@@ -217,7 +211,7 @@ void* download_signed( void *sock_addr,
     if (request_len == -1)
         return NULL;
 
-    data = download(sock_addr, addr_len, request, request_len, &len, downloaded_len_max + crypto_sign_ed25519_BYTES);
+    data = download(sock_addr, addr_len, request, request_len, &len);
     if (!data) {
         return NULL;
     }
@@ -233,7 +227,7 @@ void* download_signed( void *sock_addr,
     LOG_TO_FILE("signed %u, now %u\n", (uint32_t)t, (uint32_t)now);
 
     if (t < now && now - t >= 60 * 60 * 24 * UPDATE_EXPIRE_DAYS) {
-        /* build is more than 1 week old: expired */
+        /* build is more than 14 days old: expired */
         LOG_TO_FILE("expired signature (%u)\n", (uint32_t)(now - t));
         free(mdata);
         return NULL;
@@ -256,7 +250,8 @@ void* download_signed_compressed( void *sock_addr,
     char *data, *mdata;
     uint32_t len, mlen;
 
-    mdata = download_signed(sock_addr, addr_len, host, host_len, filename, filename_len, &mlen, downloaded_len_max, self_public_key);
+    mdata = download_signed(sock_addr, addr_len, host, host_len, filename, filename_len,
+                            &mlen, self_public_key);
     if (!mdata) {
         LOG_TO_FILE("file download failed\n");
         return NULL;
@@ -284,100 +279,91 @@ void* download_signed_compressed( void *sock_addr,
 
 #define TRY_TIMES 2
 
-void *download_loop_all_host_ips( bool compressed,
-                                  const char *hosts[],
-                                  size_t number_hosts,
-                                  const char *filename,
-                                  size_t filename_len,
-                                  uint32_t *downloaded_len,
-                                  uint32_t downloaded_len_max,
-                                  const uint8_t *self_public_key,
-                                  const char *cmp_end_file,
-                                  size_t cmp_end_file_len)
+void *download_from_host( bool compressed,
+                          const char *host,
+                          const char *filename,
+                          size_t filename_len,
+                          uint32_t *downloaded_len,
+                          const uint8_t *self_public_key,
+                          const char *cmp_end_file,
+                          size_t cmp_end_file_len)
 {
-    time_t now = time(NULL);
-    unsigned int i;
+    struct addrinfo *root;
 
-    for (i = 0; i < (number_hosts * TRY_TIMES); ++i) {
-        unsigned int index = (i + now) % number_hosts;
-        struct addrinfo *root, *info;
+    if (getaddrinfo(host, "80", NULL, &root) != 0) {
+        LOG_TO_FILE("getaddrinfo failed for host [%s]\n", host);
+        return NULL;
+    }
 
-        if (getaddrinfo(hosts[index], "80", NULL, &root) != 0) {
-            LOG_TO_FILE("getaddrinfo failed for host [%s]\n", hosts[index]);
+    for (struct addrinfo *info = root; info; info = info->ai_next) {
+        LOG_TO_FILE("addrinfo %i %i %i %i %i\n", info->ai_flags,    info->ai_family,
+                                                 info->ai_socktype, info->ai_protocol,
+                                                 info->ai_addrlen);
+        if (info->ai_socktype && info->ai_socktype != SOCK_STREAM) {
             continue;
         }
 
-        info = root;
+        LOG_TO_FILE("Trying host %s\n", host);
+        void *data = 0;
+        uint32_t dled_len = 0;
+        if (compressed) {
+            data = download_signed_compressed(info->ai_addr,
+                                              info->ai_addrlen,
+                                              host,
+                                              strlen(host),
+                                              filename, filename_len,
+                                              &dled_len,
+                                              UINT32_MAX,
+                                              self_public_key);
+        } else {
+            data = download_signed(info->ai_addr,
+                                   info->ai_addrlen,
+                                   host,
+                                   strlen(host),
+                                   filename,
+                                   filename_len,
+                                   &dled_len,
+                                   self_public_key);
+        }
 
-        do {
-            LOG_TO_FILE("addrinfo %i %i %i %i %i\n", info->ai_flags, info->ai_family, info->ai_socktype, info->ai_protocol, info->ai_addrlen);
-            if (info->ai_socktype && info->ai_socktype != SOCK_STREAM) {
+        if (!data) {
+            LOG_TO_FILE("data is NULL\n");
+            continue;
+        }
+
+        if (cmp_end_file && cmp_end_file_len) {
+            if (dled_len < cmp_end_file_len) {
+                LOG_TO_FILE("Too Small %u < %u\n", dled_len, cmp_end_file_len);
                 continue;
             }
 
-            LOG_TO_FILE("Trying this one\n");
-            void *data = 0;
-            uint32_t dled_len = 0;
-            if (compressed) {
-                data = download_signed_compressed(info->ai_addr,
-                                                  info->ai_addrlen,
-                                                  hosts[index],
-                                                  strlen(hosts[index]),
-                                                  filename, filename_len,
-                                                  &dled_len,
-                                                  downloaded_len_max,
-                                                  self_public_key);
-            } else {
-                data = download_signed(info->ai_addr,
-                                       info->ai_addrlen,
-                                       hosts[index],
-                                       strlen(hosts[index]),
-                                       filename,
-                                       filename_len,
-                                       &dled_len,
-                                       downloaded_len_max,
-                                       self_public_key);
-            }
+            if (memcmp(cmp_end_file, data + (dled_len - cmp_end_file_len), cmp_end_file_len) != 0) {
+                LOG_TO_FILE("cmp_end_file cmp error length %u\n", cmp_end_file_len);
+                unsigned int j;
+                for (j = 0; j < cmp_end_file_len; ++j) {
+                    LOG_TO_FILE("%c", cmp_end_file[j]);
+                }
 
-            if (!data) {
-                LOG_TO_FILE("data is NULL\n");
+                LOG_TO_FILE("\n");
+
+                uint8_t *tmpdt = data + (dled_len - cmp_end_file_len);
+                for (j = 0; j < cmp_end_file_len; ++j) {
+                    LOG_TO_FILE("%c", tmpdt[j]);
+                }
+
+                LOG_TO_FILE("\n");
                 continue;
             }
 
-            if (cmp_end_file && cmp_end_file_len) {
-                if (dled_len < cmp_end_file_len) {
-                    LOG_TO_FILE("Too Small %u < %u\n", dled_len, cmp_end_file_len);
-                    continue;
-                }
+            dled_len -= cmp_end_file_len;
+        }
 
-                if (memcmp(cmp_end_file, data + (dled_len - cmp_end_file_len), cmp_end_file_len) != 0) {
-                    LOG_TO_FILE("cmp_end_file cmp error length %u\n", cmp_end_file_len);
-                    unsigned int j;
-                    for (j = 0; j < cmp_end_file_len; ++j) {
-                        LOG_TO_FILE("%c", cmp_end_file[j]);
-                    }
-
-                    LOG_TO_FILE("\n");
-
-                    uint8_t *tmpdt = data + (dled_len - cmp_end_file_len);
-                    for (j = 0; j < cmp_end_file_len; ++j) {
-                        LOG_TO_FILE("%c", tmpdt[j]);
-                    }
-
-                    LOG_TO_FILE("\n");
-                    continue;
-                }
-
-                dled_len -= cmp_end_file_len;
-            }
-
-            *downloaded_len = dled_len;
-            freeaddrinfo(root);
-            return data;
-        } while ((info = info->ai_next));
-
+        *downloaded_len = dled_len;
         freeaddrinfo(root);
+        return data;
     }
+
+    freeaddrinfo(root);
 
     return NULL;
 }
