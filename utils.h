@@ -18,8 +18,6 @@ void *download_from_host( bool compressed,
                           const char *filename,
                           size_t filename_len,
                           uint32_t *downloaded_len,
-                          const uint8_t *self_public_key,
-                          const char *cmp_end_file,
-                          size_t cmp_end_file_len);
+                          const uint8_t *self_public_key);
 
 #endif

@@ -279,14 +279,12 @@ void* download_signed_compressed( void *sock_addr,
 
 #define TRY_TIMES 2
 
-void *download_from_host( bool compressed,
-                          const char *host,
-                          const char *filename,
-                          size_t filename_len,
-                          uint32_t *downloaded_len,
-                          const uint8_t *self_public_key,
-                          const char *cmp_end_file,
-                          size_t cmp_end_file_len)
+void *download_from_host(bool compressed,
+                         const char *host,
+                         const char *filename,
+                         size_t filename_len,
+                         uint32_t *downloaded_len,
+                         const uint8_t *self_public_key)
 {
     struct addrinfo *root;
 
@@ -296,9 +294,6 @@ void *download_from_host( bool compressed,
     }
 
     for (struct addrinfo *info = root; info; info = info->ai_next) {
-        LOG_TO_FILE("addrinfo %i %i %i %i %i\n", info->ai_flags,    info->ai_family,
-                                                 info->ai_socktype, info->ai_protocol,
-                                                 info->ai_addrlen);
         if (info->ai_socktype && info->ai_socktype != SOCK_STREAM) {
             continue;
         }
@@ -329,33 +324,6 @@ void *download_from_host( bool compressed,
         if (!data) {
             LOG_TO_FILE("data is NULL\n");
             continue;
-        }
-
-        if (cmp_end_file && cmp_end_file_len) {
-            if (dled_len < cmp_end_file_len) {
-                LOG_TO_FILE("Too Small %u < %u\n", dled_len, cmp_end_file_len);
-                continue;
-            }
-
-            if (memcmp(cmp_end_file, data + (dled_len - cmp_end_file_len), cmp_end_file_len) != 0) {
-                LOG_TO_FILE("cmp_end_file cmp error length %u\n", cmp_end_file_len);
-                unsigned int j;
-                for (j = 0; j < cmp_end_file_len; ++j) {
-                    LOG_TO_FILE("%c", cmp_end_file[j]);
-                }
-
-                LOG_TO_FILE("\n");
-
-                uint8_t *tmpdt = data + (dled_len - cmp_end_file_len);
-                for (j = 0; j < cmp_end_file_len; ++j) {
-                    LOG_TO_FILE("%c", tmpdt[j]);
-                }
-
-                LOG_TO_FILE("\n");
-                continue;
-            }
-
-            dled_len -= cmp_end_file_len;
         }
 
         *downloaded_len = dled_len;
